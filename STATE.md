@@ -30,7 +30,7 @@ trailers (user instruction, 2026-11-10).
 | Property | Value |
 |---|---|
 | Format | PE32 x86 (i386), **EXE (not DLL)**, console subsystem (3) |
-| Linker | 14.30; timestamp 0x625F5BBF = 2022-04-20 07:42:55 UTC |
+| Linker | 14.30; timestamp 0x625F5BBF = 2022-04-20 01:02:55 UTC |
 | Sections | `.text .rdata .data .rsrc .reloc` (5 — LTCG-merged) |
 | Exports / TLS | none / none |
 | Manifest | `requireAdministrator` (RT_MANIFEST, 392 bytes, lang 1033) |
@@ -104,8 +104,8 @@ link `/LTCG /SUBSYSTEM:CONSOLE /DEBUG /MANIFEST:EMBED
 | PE surface (machine, subsystem, sections, DllCharacteristics, GuardFlags) | **PASS** |
 | Manifest | **PASS** (byte-identical, 392 bytes) |
 | Win32/MSVCP imports | **PASS** (all functional imports present) |
-| Behavioural tests | **PASS 2/2** (stdout + exit code identical; absent/present game) |
-| User functions structurally near-identical | 1/2 ≥95% (GetProcessId 95.2%); main 88.2% with documented toolset reason; **weighted 89.9%** |
+| Behavioural tests | **PASS 2/2**, deterministic (stdout + exit code identical; absent/present game). Harness patches only the single `call _getwch` site in test copies (`mov eax,120;nop`) because headless consoles cannot feed a key reliably; see `tests/README.md`. |
+| User functions structurally near-identical | 1/2 ≥95% (GetProcessId 95.2%); main 88.2% with documented toolset reason; **weighted 89.9%**, enforced as a hard ≥85% check by `tools/verify.py` |
 | BLOCKED | none |
 
 ## Open questions
@@ -118,6 +118,27 @@ link `/LTCG /SUBSYSTEM:CONSOLE /DEBUG /MANIFEST:EMBED
 3. **IDA database backup**: `.id0/.id1/.nam` are file-locked by the running IDA session;
    only `.id2/.til` were copied. No bulk rename/type surgery was performed; the DB can be
    regenerated from the original EXE.
+
+## Review fixes applied (2026-11-10)
+
+Code review findings were applied to the tooling/tests/docs (the recovered binary
+behaviour is untouched):
+
+- `tests/make_test_copies.py` + deterministic `behavior_test.py` (patched `_getwch` call
+  site in test copies only; scenario-branch assertions; per-run dummy; refuses to run if a
+  real `left4dead2.exe` is present).
+- `tests/build_dummy.bat` creates `tests/bin`; dummy sleeps 120 s and lives per run.
+- `tools/msvc_env.bat` honours a caller-supplied `VSTOOLS` and validates it
+  (`build_144.bat` now really uses MSVC 14.44; verified linker version 14.44).
+- `tools/verify.py`: correct export ordinal parsing, ILT/IAT fallback, full import check
+  with an explicit codegen allowlist, structural similarity enforced (≥85%).
+- `tools/compare.py`: defaults to `build/`, cached whole-image disassembly, objdump
+  availability error, `___local_stdio_printf_options` symbol mapping, generic map sections.
+- `tools/pe_info.py`: load-config struct Size fix (SEH table 0x40366C/2 now reported),
+  PE32+ rejected clearly, default path anchored to the repo root.
+- Docs: timestamp corrected to **2022-04-20 01:02:55 UTC**, `/guard:cf` wording fixed,
+  `printf(path)`/`CreateRemoteThread`/`GetCurrentDirectoryA`/`WaitForSingleObject` quirks
+  documented, VR.dll cwd wording fixed, objdump prerequisite documented.
 
 ## Next (only if requested)
 

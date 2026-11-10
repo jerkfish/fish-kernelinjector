@@ -4,9 +4,11 @@
 Checks, per the recovery plan:
   1. PE surface: machine, subsystem, sections, DllCharacteristics, load-config GuardFlags.
   2. Exports: names/ordinals (both must have none).
-  3. Imports: every original import must be present; extras are listed (toolset CRT deltas).
+  3. Imports: every original import must be present, except an explicit allowlist of
+     codegen-inlined CRT helpers; extras are listed as toolset CRT deltas.
   4. Manifest resource must be byte-identical.
-  5. Structural diff of user functions (via tools/compare.py).
+  5. Structural diff of user functions (via tools/compare.py): both user functions must
+     be present and their weighted instruction similarity must meet a threshold.
 Behavioural testing lives in tests/behavior_test.py.
 
 Usage: python tools/verify.py
@@ -85,14 +87,15 @@ class Info:
         if not rva:
             return out
         o = self.off(rva)
-        while True:
+        while o is not None:
+            ilt = u32(self.d, o)
             name_rva = u32(self.d, o + 12)
             first = u32(self.d, o + 16)
-            if name_rva == 0 and first == 0:
+            if ilt == 0 and name_rva == 0 and first == 0:
                 break
             dll = cstr(self.d, self.off(name_rva))
-            thunk = self.off(u32(self.d, o))
-            while True:
+            thunk = self.off(ilt or first)   # ILT may be absent; fall back to IAT
+            while thunk is not None:
                 val = u32(self.d, thunk)
                 if val == 0:
                     break
@@ -112,13 +115,16 @@ class Info:
         nnames = u32(self.d, o + 24)
         funcs_rva = u32(self.d, o + 28)
         names_rva = u32(self.d, o + 32)
+        ords_rva = u32(self.d, o + 36)
         no = self.off(names_rva)
         fo = self.off(funcs_rva)
+        oo = self.off(ords_rva)
         out = []
         for i in range(nnames):
             nm = cstr(self.d, self.off(u32(self.d, no + i * 4)))
-            ordinal = u32(self.d, fo + i * 4)
-            out.append((nm, ordinal))
+            ordinal = u16(self.d, oo + i * 2)      # index into the EAT
+            frva = u32(self.d, fo + ordinal * 4)
+            out.append((nm, ordinal, frva))
         return out
 
     def _resource(self, rtype, rid):
@@ -185,13 +191,14 @@ def main():
     print("\n== imports ==")
     missing = sorted(a.imports - b.imports)
     extra = sorted(b.imports - a.imports)
-    # Codegen-dependent CRT helpers (e.g. memcpy) may be inlined by a newer toolset;
-    # what must match is the functional Win32/STL surface.
-    missing_functional = [m for m in missing
-                          if m[0].lower().startswith("kernel32") or m[0].startswith("MSVCP")]
-    check(not missing_functional, "Win32/MSVCP import surface present", str(missing_functional))
-    if missing:
-        print(f"  [INFO] {len(missing)} inlined/CRT-helper import delta: {missing}")
+    # Explicit, reviewed allowlist: helpers the newer compiler inlines away instead of
+    # importing (the operation is still performed, just inline).
+    ALLOWED_MISSING = {("VCRUNTIME140.dll", "memcpy")}
+    missing_unexpected = [m for m in missing if m not in ALLOWED_MISSING]
+    check(not missing_unexpected,
+          f"all original imports present ({len(a.imports)} checked; "
+          f"allowlisted codegen deltas: {sorted(ALLOWED_MISSING)})",
+          str(missing_unexpected))
     print(f"  [INFO] {len(extra)} toolset/CRT-only extras: {extra}")
 
     print("\n== manifest ==")
@@ -199,33 +206,40 @@ def main():
           f"{len(a.manifest or b'')} vs {len(b.manifest or b'')} bytes")
 
     print("\n== structural diff (user functions) ==")
+    MIN_USER_SIM = 85.0
     build_dir = REBUILT.parent
-    funcs = compare.parse_map(build_dir / "SKernelInjector.map", 0x1000)
-    new_targets = {}
-    for sym, (va, sz) in funcs.items():
-        canon = compare.SYMBOL_CANON.get(sym)
-        if canon:
-            new_targets[va] = canon
+    funcs = compare.parse_map(build_dir / "SKernelInjector.map")
+    new_targets = compare.new_target_map(funcs)
+    found_user = set()
     weight = score = 0.0
-    for disp, ostart, oend, symbol in compare.ORIGINAL_FUNCS:
-        if symbol not in funcs:
-            continue
-        nstart, nsize = funcs[symbol]
-        oi = compare.disasm(compare.PE(ORIGINAL), ostart, oend)
-        ni = compare.disasm(compare.PE(REBUILT), nstart, nstart + nsize)
-        on = compare.normalize(oi, ostart, oend, compare.PE(ORIGINAL).iat, compare.ORIG_STARTS)
-        nn = compare.normalize(ni, nstart, nstart + nsize, compare.PE(REBUILT).iat, new_targets)
-        l = compare.lcs(on, nn)
-        sim = 200.0 * l / (len(on) + len(nn)) if on and nn else 0.0
-        oc = compare.call_targets(oi, ostart, oend, compare.PE(ORIGINAL).iat, compare.ORIG_STARTS)
-        nc = compare.call_targets(ni, nstart, nstart + nsize, compare.PE(REBUILT).iat, new_targets)
-        cs = 100.0 * len(set(oc) & set(nc)) / max(len(set(oc) | set(nc)), 1)
-        print(f"  {disp:42s} size 0x{oend-ostart:03X} vs 0x{nsize:03X}  "
-              f"LCS {sim:5.1f}%  calls {cs:5.1f}%")
-        if disp in ("main", "CProcess::GetProcessId"):
-            weight += oend - ostart
-            score += sim * (oend - ostart)
-    print(f"  weighted user-code instruction similarity: {score / weight:.1f}%")
+    try:
+        orig_pe = compare.PE(ORIGINAL)
+        new_pe = compare.PE(REBUILT)
+        for disp, ostart, oend, symbol in compare.ORIGINAL_FUNCS:
+            if symbol not in funcs:
+                continue
+            nstart, nsize = funcs[symbol]
+            m = compare.score_function(orig_pe, new_pe, ostart, oend, nstart, nsize,
+                                       new_targets)
+            print(f"  {disp:42s} size 0x{m['orig_size']:03X} vs 0x{m['new_size']:03X}  "
+                  f"LCS {m['ins_sim']:5.1f}%  calls {m['call_sim']:5.1f}%")
+            if disp in compare.USER_FUNCS:
+                found_user.add(disp)
+                weight += oend - ostart
+                score += m["ins_sim"] * (oend - ostart)
+    except RuntimeError as exc:
+        check(False, "structural diff available", str(exc))
+        weight = 0.0
+    required = set(compare.USER_FUNCS)
+    check(required <= found_user, "both user functions present in rebuild map",
+          f"missing: {sorted(required - found_user)}")
+    if weight:
+        sim = score / weight
+        print(f"  weighted user-code instruction similarity: {sim:.1f}%")
+        check(sim >= MIN_USER_SIM,
+              f"user-code structural similarity >= {MIN_USER_SIM:.0f}%", f"{sim:.1f}%")
+    else:
+        check(False, "user-code structural similarity computable", "no user functions scored")
     print("  NOTE: main's residual delta is toolset inlining/scheduling (see README).")
 
     print("\n== result ==")

@@ -5,7 +5,7 @@ All addresses are virtual addresses (image base 0x400000). Evidence gathered fro
 
 ## 1. Identity / build fingerprint
 
-- COFF timestamp `0x625F5BBF` → 2022-04-20 07:42:55 UTC.
+- COFF timestamp `0x625F5BBF` → 2022-04-20 01:02:55 UTC.
 - Optional header: linker 14.30, subsystem 3 (console), OS/subsystem version 6.0.
 - Debug directory CodeView entry: `RSDS`, GUID `db6f12fb-a592-0d4c-ab8c-b0b62d16904c`, age 1,
   path `E:\l4d2\Win32\Release\SKernelInjector.pdb`.
@@ -14,7 +14,8 @@ All addresses are virtual addresses (image base 0x400000). Evidence gathered fro
   Product IDs 255–265 belong to the VS2022-era product numbering.
 - Load config `GuardFlags = 0x100` (CF_INSTRUMENTED), GuardCFCheckFunctionPointer = 0x403138,
   GuardCFFunctionTable = 0, count = 0. Interpretation: CRT startup objects (from
-  `libvcruntime`) are CFG-instrumented, user objects are not; the link step had `/guard:cf`.
+  `libvcruntime`) are CFG-instrumented, user objects are not. The link step did **not**
+  pass `/guard:cf` (no CFG function table is emitted; see section 8.4).
   Evidence: in `__scrt_common_main_seh` at 0x40186C there is
   `call ds:___guard_check_icall_fptr` before `call esi`, while the user function at
   0x40139F has a raw `call ebx` (Process32Next).
@@ -141,11 +142,11 @@ all belong to `std::exception`/`std::bad_alloc`/`std::bad_array_new_length`/`typ
 | Language | C++ (MSVC), std::string used | `_Xlength_error` import, string layout, EH machinery. High |
 | `CProcess` layout | `HANDLE hProcess; std::string name;` sizeof 0x1C | allocation size 0x1C, accesses +0/+4/+0x14/+0x18. High |
 | Member function | `DWORD CProcess::GetProcessId()` (or similar) | `__thiscall` with string member accessed via this. High |
-| Object creation | `new CProcess()` value-init | full zeroing before ctor field writes. High |
-| String set via assignment | `p->name = "left4dead2.exe"` after construction | default-ctor fields written, then `assign(ptr,14)`. Medium-high (could be ctor-from-literal inlined differently) |
+| Object creation | `new CProcess{}` value-init, owned by `std::unique_ptr` | full zeroing before ctor field writes + EH cleanup state never disarmed (section 8.1). High |
+| String set | `assign("left4dead2.exe", 14)`; the original inlined `operator=` into that call | default-ctor fields written, then a direct `assign(ptr,14)` call in the binary (section 8.2). High |
 | Failure structure | pid==0 prints pid message then generic init message; OpenProcess only on pid!=0 path | exact disassembly flow 0x40108D–0x4010C7. High |
 | Return value | result of `_getwch()` | value stored to `[ebp-0x118]` then returned. High |
-| Compiler flags | /O2 /MD /GS /EHsc /guard:cf(link), PE32 Release | fingerprint above. Medium-high |
+| Compiler flags | `/O2 /Ob1 /GL /MD /GS /EHsc`, link `/LTCG`, **no** link-time `/guard:cf` | fingerprint + flag experiments (section 8.4). High |
 | Purpose | Console injector: loads `VR.dll` into `left4dead2.exe` via CreateRemoteThread+LoadLibraryA | strings + API sequence. High |
 
 ## 8. Phase 3 findings (source-form decisions)

@@ -167,6 +167,9 @@ def main(path: Path) -> None:
     magic = u16(data, opt)
     pe32plus = magic == 0x20B
     print(f"optional magic  : 0x{magic:04X} ({'PE32+' if pe32plus else 'PE32'})")
+    if pe32plus:
+        print("PE32+ (x64) images are not supported by this PE32-only recon dump.")
+        return
     link_major = data[opt + 2]
     link_minor = data[opt + 3]
     print(f"linker version  : {link_major}.{link_minor}")
@@ -366,16 +369,23 @@ def main(path: Path) -> None:
     print("\nLoad config:")
     if lc and lc[1]:
         o = rva_to_off(lc[1])
-        size = lc[2]
-        cookie_va = u32(data, o + 60) if size >= 64 else 0
-        seh_va = u32(data, o + 64) if size >= 68 else 0
+        struct_size = u32(data, o)          # IMAGE_LOAD_CONFIG_DIRECTORY32.Size
+        dir_size = lc[2]                    # data-directory entry size
+        cookie_va = u32(data, o + 0x3C) if struct_size >= 0x40 else 0
+        seh_va = u32(data, o + 0x40) if struct_size >= 0x44 else 0
+        seh_count = u32(data, o + 0x44) if struct_size >= 0x48 else 0
+        guard_flags = u32(data, o + 0x58) if struct_size >= 0x5C else None
+        print(f"  Size 0x{struct_size:X} (data directory entry 0x{dir_size:X})")
         print(f"  SecurityCookie VA 0x{cookie_va:X}")
-        print(f"  SEHandlerTable VA 0x{seh_va:X}")
-        print(f"  Size 0x{size:X}")
+        print(f"  SEHandlerTable VA 0x{seh_va:X} count {seh_count}")
+        if guard_flags is not None:
+            print(f"  GuardFlags 0x{guard_flags:X}")
     else:
         print("  (none)")
 
 
+ROOT = Path(__file__).resolve().parent.parent
+
 if __name__ == "__main__":
-    target = Path(sys.argv[1]) if len(sys.argv) > 1 else Path("original/SKernelInjector.exe")
+    target = Path(sys.argv[1]) if len(sys.argv) > 1 else ROOT / "original" / "SKernelInjector.exe"
     main(target)

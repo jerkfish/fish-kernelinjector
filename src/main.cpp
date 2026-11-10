@@ -79,6 +79,8 @@ int main()
     }
 
     char szDllPath[MAX_PATH];
+    // QUIRK: return value ignored; the buffer is undefined if the cwd is unavailable or
+    // does not fit, and strcat_s can trip the invalid-parameter handler (original behaviour).
     GetCurrentDirectoryA(MAX_PATH, szDllPath);
     strcat_s(szDllPath, "\\VR.dll");
     printf("DLL Path: ");
@@ -91,6 +93,9 @@ int main()
     LPVOID pRemoteMem = NULL;
     HANDLE hThread = NULL;
 
+    // QUIRK: CreateRemoteThread returns NULL on failure, so the INVALID_HANDLE_VALUE
+    // comparison never triggers; a failed creation takes the success branch and prints
+    // "Successfully injected" (original behaviour).
     if (pLoadLibraryA &&
         (pRemoteMem = VirtualAllocEx(pProcess->hProcess, NULL, strlen(szDllPath) + 1,
                                      MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE)) != NULL &&
@@ -99,6 +104,7 @@ int main()
         (hThread = CreateRemoteThread(pProcess->hProcess, NULL, 0, pLoadLibraryA,
                                       pRemoteMem, 0, NULL)) != INVALID_HANDLE_VALUE)
     {
+        // QUIRK: no timeout and the wait result is ignored (original behaviour).
         WaitForSingleObject(hThread, INFINITE);
         VirtualFreeEx(pProcess->hProcess, pRemoteMem, 0, MEM_RELEASE);
         printf("\nSuccessfully injected, Please close this window!\n\n\n\n");

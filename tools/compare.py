@@ -1,24 +1,30 @@
 #!/usr/bin/env python3
 """Structural comparison of original vs rebuilt SKernelInjector.exe.
 
-- Extracts per-function instruction streams with objdump (MinGW).
+- Extracts per-function instruction streams with objdump (MinGW binutils; must be on
+  PATH - see README "Prerequisites").
 - Normalizes addresses (IAT slots -> import names, internal targets -> symbols,
   other absolute addresses -> ADDR) while keeping constants/stack offsets.
 - Scores each function with an LCS ratio over normalized instructions and
   over mnemonic sequences; reports sizes, instruction counts, branch counts.
 
-Usage: python tools/compare.py [build_dir]
+Usage: python tools/compare.py [build_dir]     (default: build)
 """
 from __future__ import annotations
 
 import re
+import shutil
 import struct
 import subprocess
 import sys
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
-OBJDUMP = "objdump"
+OBJDUMP = (
+    shutil.which("objdump")
+    or shutil.which("objdump", path=r"C:\MinGW\bin")
+    or "objdump"
+)
 
 # Canonical names for call-target normalisation (original VAs).
 ORIG_STARTS = {
@@ -41,6 +47,7 @@ SYMBOL_CANON = {
     "_main": "main",
     "?GetProcessId@CProcess@@QAEKXZ": "GetProcessId",
     "_printf": "printf",
+    "___local_stdio_printf_options": "__local_stdio_printf_options",
     "?assign@?$basic_string@DU?$char_traits@D@std@@V?$allocator@D@2@@std@@QAEAAV12@QBDI@Z": "string_assign",
     "??2@YAPAXI@Z": "operator_new",
     "@__security_check_cookie@4": "__security_check_cookie",
@@ -53,16 +60,16 @@ SYMBOL_CANON = {
     "??0CProcess@@QAE@XZ": "CProcess_ctor",
 }
 
-# (display name, VA start, VA end, rebuilt symbol match)
+# (display name, VA start, VA end, rebuilt symbol match) - user functions first.
 ORIGINAL_FUNCS = [
     ("main", 0x401000, 0x4012B0, "_main"),
     ("CProcess::GetProcessId", 0x401300, 0x4013DC, "?GetProcessId@CProcess@@QAEKXZ"),
     ("printf (UCRT inline)", 0x4012D0, 0x401300, "_printf"),
     ("std::string::assign(char const*, size_t)", 0x401550, 0x40167F,
      "?assign@?$basic_string@DU?$char_traits@D@std@@V?$allocator@D@2@@std@@QAEAAV12@QBDI@Z"),
-    ("operator delete", 0x40168E, 0x40169C, None),
-    ("__local_stdio_printf_options", 0x4012C0, 0x4012C6, None),
 ]
+
+USER_FUNCS = ("main", "CProcess::GetProcessId")
 
 
 def u32(d: bytes, o: int) -> int:
@@ -90,6 +97,7 @@ class PE:
             self.sections.append((name, va, vs, rp, rs))
         self.iat = {}
         self._parse_iat(opt)
+        self._disasm = None
 
     def off(self, rva: int):
         for _n, va, vs, rp, rs in self.sections:
@@ -129,18 +137,25 @@ class PE:
             o += 20
 
 
-def parse_map(path: Path, section_rva: int):
-    """Return {name: (va, size)} for functions in the given section."""
+def parse_map(path: Path):
+    """Return {name: (va, size)} for all function symbols in a link map.
+
+    MAP lines look like:  ``0001:00002900 _main 00403900 f main.obj``
+    (section:offset, symbol, VA, flags, object). Section numbers are not assumed.
+    """
     funcs = []
     for ln in path.read_text(errors="replace").splitlines():
         t = ln.split()
-        if len(t) >= 5 and re.fullmatch(r"0001:[0-9A-Fa-f]{8}", t[0]) and \
-                re.fullmatch(r"[0-9A-Fa-f]{8}", t[2]):
-            try:
-                va = int(t[2], 16)
-            except ValueError:
-                continue
-            funcs.append((va, t[1]))
+        if len(t) < 5 or not re.fullmatch(r"\d{4}:[0-9A-Fa-f]{8}", t[0]) or \
+                not re.fullmatch(r"[0-9A-Fa-f]{8}", t[2]):
+            continue
+        if "f" not in t[3].lower():
+            continue
+        try:
+            va = int(t[2], 16)
+        except ValueError:
+            continue
+        funcs.append((va, t[1]))
     funcs.sort()
     out = {}
     for i, (va, name) in enumerate(funcs):
@@ -154,25 +169,36 @@ INSTR_RE = re.compile(r"^\s*([0-9a-fA-F]+):\s+(?:[0-9a-fA-F]{2} )+\s*\t(.*)$")
 HEX_RE = re.compile(r"0x([0-9a-fA-F]+)")
 
 
-def disasm(pe: PE, start: int, end: int):
-    cmd = [OBJDUMP, "-d", "-M", "intel", "--start-address=%d" % start,
-           "--stop-address=%d" % end, str(pe.path)]
-    out = subprocess.run(cmd, capture_output=True, text=True, errors="replace").stdout
+def disasm_all(pe: PE):
+    """Disassemble the whole image once and cache the instruction list."""
+    if pe._disasm is not None:
+        return pe._disasm
+    if not shutil.which(OBJDUMP) and not Path(OBJDUMP).exists():
+        raise RuntimeError(
+            "objdump not found on PATH. The structural diff needs MinGW binutils; "
+            "install it (e.g. C:\\MinGW\\bin) or add objdump to PATH."
+        )
+    cmd = [OBJDUMP, "-d", "-M", "intel", str(pe.path)]
+    try:
+        out = subprocess.run(cmd, capture_output=True, text=True, errors="replace").stdout
+    except OSError as exc:
+        raise RuntimeError(f"failed to run objdump: {exc}") from exc
     instrs = []
     for ln in out.splitlines():
         m = INSTR_RE.match(ln)
         if not m:
             continue
         addr = int(m.group(1), 16)
-        text = m.group(2).strip()
-        text = re.sub(r"\s+", " ", text)
-        # strip objdump annotations
+        text = re.sub(r"\s+", " ", m.group(2).strip())
         text = text.split("#")[0].strip()
         parts = text.split(" ", 1)
-        mnem = parts[0]
-        ops = parts[1] if len(parts) > 1 else ""
-        instrs.append((addr, mnem, ops))
+        instrs.append((addr, parts[0], parts[1] if len(parts) > 1 else ""))
+    pe._disasm = instrs
     return instrs
+
+
+def disasm(pe: PE, start: int, end: int):
+    return [i for i in disasm_all(pe) if start <= i[0] < end]
 
 
 def normalize(instrs, start, end, iat, target_names):
@@ -229,55 +255,86 @@ def lcs(a, b):
     return prev[-1]
 
 
-def main():
-    build_dir = Path(sys.argv[1]) if len(sys.argv) > 1 else ROOT / "build_unique"
-    orig = PE(ROOT / "original" / "SKernelInjector.exe")
-    new = PE(build_dir / "SKernelInjector.exe")
-    funcs = parse_map(build_dir / "SKernelInjector.map", 0x1000)
-    new_targets = {}
-    for sym, (va, sz) in funcs.items():
+def score_function(orig: PE, new: PE, ostart: int, oend: int,
+                   nstart: int, nsize: int, new_targets: dict):
+    """Return a dict of similarity metrics for one function pair."""
+    nend = nstart + nsize
+    oi = disasm(orig, ostart, oend)
+    ni = disasm(new, nstart, nend)
+    on = normalize(oi, ostart, oend, orig.iat, ORIG_STARTS)
+    nn = normalize(ni, nstart, nend, new.iat, new_targets)
+    l = lcs(on, nn)
+    lm = lcs([x.split(" ")[0] for x in on], [x.split(" ")[0] for x in nn])
+    oc = call_targets(oi, ostart, oend, orig.iat, ORIG_STARTS)
+    nc = call_targets(ni, nstart, nend, new.iat, new_targets)
+    return {
+        "orig_size": oend - ostart,
+        "new_size": nsize,
+        "orig_ins": len(on),
+        "new_ins": len(nn),
+        "lcs": l,
+        "ins_sim": 200.0 * l / (len(on) + len(nn)) if on and nn else 0.0,
+        "mnem_sim": 200.0 * lm / (len(on) + len(nn)) if on and nn else 0.0,
+        "orig_branches": len({a for a, m, o in oi if m.startswith("j") or m == "call"}),
+        "new_branches": len({a for a, m, o in ni if m.startswith("j") or m == "call"}),
+        "call_sim": 100.0 * len(set(oc) & set(nc)) / max(len(set(oc) | set(nc)), 1),
+    }
+
+
+def new_target_map(funcs):
+    targets = {}
+    for sym, (va, _sz) in funcs.items():
         canon = SYMBOL_CANON.get(sym)
         if canon:
-            new_targets[va] = canon
+            targets[va] = canon
+    return targets
+
+
+def main():
+    build_dir = Path(sys.argv[1]) if len(sys.argv) > 1 else ROOT / "build"
+    orig = PE(ROOT / "original" / "SKernelInjector.exe")
+    new = PE(build_dir / "SKernelInjector.exe")
+    funcs = parse_map(build_dir / "SKernelInjector.map")
+    new_targets = new_target_map(funcs)
 
     print(f"original: {orig.path}  ({len(orig.data)} bytes)")
     print(f"rebuilt : {new.path}  ({len(new.data)} bytes)")
     print(f"build funcs in .text: {len(funcs)}")
     print()
-    header = f"{'function':42s} {'orig':>6s} {'new':>6s} {'ins':>4s}/{'':4s} {'LCS%':>6s} {'mnem%':>6s} {'blocks':>6s} {'calls%':>7s}"
+    header = (f"{'function':42s} {'orig':>6s} {'new':>6s} {'ins':>4s}/{'':4s} "
+              f"{'LCS%':>6s} {'mnem%':>6s} {'blocks':>6s} {'calls%':>7s}")
     print(header)
     print("-" * len(header))
     total_weight = 0.0
     total_score = 0.0
-    user_funcs = {"main", "CProcess::GetProcessId"}
+    missing_user = []
     for disp, ostart, oend, symbol in ORIGINAL_FUNCS:
-        if symbol is None or symbol not in funcs:
+        if symbol not in funcs:
+            if disp in USER_FUNCS:
+                missing_user.append(disp)
             continue
         nstart, nsize = funcs[symbol]
-        nend = nstart + nsize
-        oi = disasm(orig, ostart, oend)
-        ni = disasm(new, nstart, nend)
-        on = normalize(oi, ostart, oend, orig.iat, ORIG_STARTS)
-        nn = normalize(ni, nstart, nend, new.iat, new_targets)
-        l = lcs(on, nn)
-        lm = lcs([x.split(" ")[0] for x in on], [x.split(" ")[0] for x in nn])
-        sim = 200.0 * l / (len(on) + len(nn)) if on and nn else 0.0
-        simm = 200.0 * lm / (len(on) + len(nn)) if on and nn else 0.0
-        ob = len({a for a, m, o in oi if m.startswith("j") or m == "call"})
-        nb = len({a for a, m, o in ni if m.startswith("j") or m == "call"})
-        oc = call_targets(oi, ostart, oend, orig.iat, ORIG_STARTS)
-        nc = call_targets(ni, nstart, nend, new.iat, new_targets)
-        call_sim = 100.0 * len(set(oc) & set(nc)) / max(len(set(oc) | set(nc)), 1)
-        print(f"{disp:42s} 0x{oend-ostart:04X} 0x{nsize:04X} {len(on):4d}/{len(nn):4d} "
-              f"{sim:6.1f} {simm:6.1f} {ob:3d}/{nb:3d} {call_sim:7.1f}")
-        if disp in user_funcs:
+        m = score_function(orig, new, ostart, oend, nstart, nsize, new_targets)
+        print(f"{disp:42s} 0x{m['orig_size']:04X} 0x{m['new_size']:04X} "
+              f"{m['orig_ins']:4d}/{m['new_ins']:4d} {m['ins_sim']:6.1f} "
+              f"{m['mnem_sim']:6.1f} {m['orig_branches']:3d}/{m['new_branches']:3d} "
+              f"{m['call_sim']:7.1f}")
+        if disp in USER_FUNCS:
             weight = oend - ostart
             total_weight += weight
-            total_score += sim * weight
+            total_score += m["ins_sim"] * weight
+    print()
+    if missing_user:
+        print(f"MISSING user functions in rebuilt map: {missing_user}")
     if total_weight:
-        print()
         print(f"weighted user-code similarity: {total_score / total_weight:.1f}%")
+    else:
+        print("weighted user-code similarity: n/a (no user functions found)")
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except RuntimeError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        sys.exit(2)

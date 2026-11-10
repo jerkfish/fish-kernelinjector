@@ -4,8 +4,9 @@ Clean-room source reconstruction of `SKernelInjector.exe` (19,824 bytes, SHA-256
 `085f66104949340757cdb7d79b0034677ba622f08997c0c4ba96edc3550272cf`), built from the
 binary and the IDA database only. The original PDB/source were not available.
 
-The program is a console utility that injects `VR.dll` (located next to the executable)
-into `left4dead2.exe` using the classic `CreateRemoteThread` + `LoadLibraryA` technique.
+The program is a console utility that injects `VR.dll` (resolved from the **current
+working directory**, not from the executable's directory) into `left4dead2.exe` using the
+classic `CreateRemoteThread` + `LoadLibraryA` technique.
 It prints a result banner and troubleshooting text, then waits for a key. It requests
 administrator rights in its manifest.
 
@@ -47,7 +48,15 @@ Behavioural quirks are preserved and commented in the source:
 
 - `OpenProcess` failure is compared against `INVALID_HANDLE_VALUE`, but `OpenProcess`
   returns `NULL` on failure — the check is effectively dead.
-- The DLL path is passed to `printf` as a format string.
+- `CreateRemoteThread` failure is likewise compared against `INVALID_HANDLE_VALUE`, but it
+  returns `NULL` on failure — a failed thread creation therefore enters the success
+  branch, prints "Successfully injected", and `WaitForSingleObject(NULL, INFINITE)` fails
+  immediately.
+- The DLL path is passed to `printf` as a format string (a `%` in the current directory
+  name is interpreted as a conversion directive).
+- `GetCurrentDirectoryA`'s return value is unchecked; a missing/short buffer or a long
+  current directory can leave the path buffer invalid or trip `strcat_s`.
+- `WaitForSingleObject(hThread, INFINITE)` has no timeout and its result is ignored.
 - Failure paths do not return early; execution always continues to the injection attempt.
 - `main` returns the `_getwch()` key code rather than 0.
 - The Toolhelp snapshot is not closed when the target process is absent.
@@ -59,7 +68,8 @@ Behavioural quirks are preserved and commented in the source:
 **Original fingerprint (from the binary):**
 
 - PE32 x86 console executable, image base `0x400000`
-- Linker version **14.30**, COFF timestamp **2022-04-20 07:42:55 UTC**
+- Linker version **14.30**, COFF timestamp **2022-04-20 01:02:55 UTC**
+  (`0x625F5BBF`)
 - MSVC 14.30 (VS2022 17.0.x) Rich-header products, **dynamic CRT** (`/MD`), `/O2`, `/GS`,
   `/EHsc`, **LTCG** (`/GL` + `/LTCG`; the final image has the 5 LTCG-merged sections)
 - Linker `/DEBUG` (PDB path `E:\l4d2\Win32\Release\SKernelInjector.pdb`)
@@ -86,6 +96,10 @@ tools\build.bat
 
 Output: `build/SKernelInjector.exe`, `build/SKernelInjector.map`, `build/SKernelInjector.pdb`.
 
+**Prerequisite for the structural tools:** `objdump` from MinGW binutils on `PATH` (or in
+`C:\MinGW\bin`). It is used only by `tools/compare.py` and the structural section of
+`tools/verify.py`; building and the behavioral tests do not need it.
+
 ---
 
 ## Verification
@@ -109,8 +123,8 @@ python tools\compare.py build      :: per-function instruction diff
 | Section names | **PASS** (`.text .rdata .data .rsrc .reloc`) |
 | Load-config GuardFlags | **PASS** (0x100, no CFG table) |
 | Manifest | **PASS** — RT_MANIFEST byte-identical (392 bytes) |
-| Win32/MSVCP import surface | **PASS** — all functional imports present |
-| Behavioural tests | **PASS 2/2 scenarios**, stdout and exit code identical |
+| Imports | **PASS** — all original imports present (one codegen-inlined helper, `memcpy`, allowlisted) |
+| Behavioural tests | **PASS 2/2 scenarios**, deterministic; stdout and exit code identical |
 | User functions recovered | **2/2** |
 | Structural similarity (user code, weighted) | **89.9%** |
 
@@ -123,10 +137,14 @@ Per-function structural comparison (normalized instructions, LCS):
 
 ### Behavioural test details
 
-`tests/behavior_test.py` launches the original and the rebuilt executable in identical
-conditions (each in its own console, `__COMPAT_LAYER=RunAsInvoker` because both manifests
-request elevation), waits for `_getwch()`, writes an `x` key event to the console input
-buffer, and compares stdout and exit code byte-for-byte.
+`tests/behavior_test.py` runs the original and the rebuilt executable in identical
+conditions (`__COMPAT_LAYER=RunAsInvoker` because both manifests request elevation) and
+compares stdout and exit code byte-for-byte. Because the final `_getwch()` ("press any
+key") cannot be fed deterministically from a headless harness, it first creates test
+copies via `tests/make_test_copies.py` in which the **single** `call _getwch` site is
+replaced with `mov eax, 120; nop` (120 == `'x'`); all other bytes are identical. The
+patched copies therefore exit immediately with the value the original would return after
+pressing `x`. The suite also refuses to run if a real `left4dead2.exe` is present.
 
 1. **Game absent** — no `left4dead2.exe`: both print the PID failure, "Failed process
    initialization.", the DLL path, "Injection failed!" and the troubleshooting block;
