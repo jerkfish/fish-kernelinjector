@@ -1,6 +1,23 @@
-/SKernelInjector.exe.til
+# original target artifacts at the workspace root (the copy under original/ is tracked)
 /SKernelInjector.exe
+/SKernelInjector.exe.til
 /SKernelInjector.exe.id0
 /SKernelInjector.exe.id1
 /SKernelInjector.exe.id2
 /SKernelInjector.exe.nam
+
+# build outputs
+/build/
+/build_*/
+/tools/experiments/*.obj
+*.pdb
+*.ilk
+
+# test runtime outputs
+/tests/bin/
+/tests/run_dir/
+
+# stray compiler outputs in the workspace root
+/*.obj
+
+__pycache__/
